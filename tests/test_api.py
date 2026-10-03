@@ -133,6 +133,40 @@ def test_reject_negative_tolerance():
     assert r.status_code == 422
 
 
+def test_reconstruct_dense_colocated_exact():
+    # 稠密同坐标回归：14 个标记全部在 (0,0)，参数固定，容差 6，不弃点
+    payload = {
+        "markers": [{"id": i, "x": 0, "y": 0} for i in range(1, 15)],
+        "rows": 7,
+        "cols": 7,
+        "tolerance": 6,
+        "max_outliers": 0,
+        "origin_x": {"lo": 0, "hi": 0},
+        "origin_y": {"lo": 0, "hi": 0},
+        "basis_row_x": {"lo": 1, "hi": 1},
+        "basis_row_y": {"lo": 0, "hi": 0},
+        "basis_col_x": {"lo": 0, "hi": 0},
+        "basis_col_y": {"lo": 1, "hi": 1},
+    }
+    r = client.post("/api/wafer-grids/reconstruct", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["feasible"] is True
+    assert body["discarded_count"] == 0
+    assert body["used_marker_count"] == 14
+    assert body["max_manhattan_residual"] == 4
+    assert body["total_residual"] == 36
+    expected = (
+        [[0, c] for c in range(5)]
+        + [[1, c] for c in range(4)]
+        + [[2, c] for c in range(3)]
+        + [[3, c] for c in range(2)]
+    )
+    cells = [a["grid_cell"] for a in body["assignments"]]
+    assert cells == expected
+    assert len({tuple(a) for a in cells}) == 14
+
+
 def test_reject_too_many_outliers():
     p = base_payload(max_outliers=3)
     r = client.post("/api/wafer-grids/reconstruct", json=p)

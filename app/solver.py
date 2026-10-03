@@ -10,8 +10,10 @@
 
 搜索方式：六条闭区间跨度均不超过 6，基向量组合至多 7^4 个，先按行列式为正过滤，
 再利用“标记必须能由 原点 = 坐标 - r*b1 - c*b2 落在原点区间”做快速预筛；对每组
-参数，候选格位按分量容差预筛，用 MRV 深度优先分支定界一次搜索 0..max_outliers
-个弃点的所有互异分配。全部为整数运算，结果确定、可复现。
+参数，把互异分配建模成标记-格位二分图并用多项式算法精确求解：Kuhn 最大匹配定
+最少弃点数，残差阈值二分定最小最大残差，再用一次匈牙利指派（整数费用同时编码
+残差总和与完整分配序列）定剩余两级字典序目标。全部为整数运算，结果确定、可复现，
+且在稠密同坐标标记下不会退化到指数级枚举。
 """
 from __future__ import annotations
 
@@ -20,6 +22,90 @@ from typing import Optional
 
 Cell = tuple[int, int]
 DISCARD_CELL = (-1, -1)
+
+
+def _kuhn_size(adj, stop_at=None):
+    """二分图最大匹配（Kuhn 增广路）。adj[i] 为标记 i 可占用的格位下标。
+
+    返回最多能互异分配的标记数；stop_at 给出后达到该值即可提前返回。
+    """
+    n = len(adj)
+    owner: dict[int, int] = {}
+
+    def augment(mi, seen):
+        for cj in adj[mi]:
+            if cj in seen:
+                continue
+            seen.add(cj)
+            hold = owner.get(cj)
+            if hold is None or augment(hold, seen):
+                owner[cj] = mi
+                return True
+        return False
+
+    size = 0
+    for mi in sorted(range(n), key=lambda k: (len(adj[k]), k)):
+        if adj[mi] and augment(mi, set()):
+            size += 1
+            if stop_at is not None and size >= stop_at:
+                return size
+    return size
+
+
+def _hungarian(cost):
+    """矩形最小费用指派（n <= m）：每个标记（行）分到互异列，返回 (行->列, 总费用)。
+
+    允许大整数费用；不可行边应给出大于任何有限可行总费用的哨兵值，此时只有在
+    不存在有限可行指派时才会选中不可行边。
+    """
+    n = len(cost)
+    m = len(cost[0])
+    inf = 1 + sum(max(row) for row in cost)
+    u = [0] * (n + 1)
+    v = [0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            row = cost[i0 - 1]
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = row[j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = [0] * n
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    total = sum(cost[i][assignment[i]] for i in range(n))
+    return assignment, total
 
 
 @dataclass(frozen=True)
@@ -95,7 +181,16 @@ def solve(
     global_best: Optional[_Solution] = None
 
     def consider(ox, oy, b1x, b1y, b2x, b2y, cand, forced):
-        """对一组参数做互异分配搜索并更新全局最优。forced 为无候选标记下标集合。"""
+        """对一组参数求字典序最优互异分配并更新全局最优。
+
+        forced 为完全没有容差内候选格位的标记下标集合（必须弃去）。
+        把所有标记到“真实格位 + 弃点虚拟列”的指派一次性建模：
+          1. Kuhn 最大匹配定最少弃点数；
+          2. 残差阈值升序扫描定最小最大曼哈顿残差；
+          3. 一次匈牙利指派，整数费用按
+             “弃点数 ≫ 残差总和 ≫ 完整分配序列”分级编码，
+             同时定最小残差总和与字典序最小分配序列。
+        """
         nonlocal global_best, any_all_fit
         stats["parameter_sets_evaluated"] += 1
         if not forced:
@@ -106,100 +201,136 @@ def solve(
         if len(forced) > budget:
             return
 
-        # MRV：候选格位少的标记优先，尽早触发格位冲突剪枝
-        order = sorted(
-            (i for i in range(n) if cand[i]), key=lambda i: (len(cand[i]), i)
-        )
-        used: set[Cell] = set()
-        assign: dict[int, Cell] = {}
-        discarded: dict[int, str] = {
-            i: "no_cell_within_tolerance" for i in forced
-        }
-
-        def can_complete(start, discard_left):
-            """前向检查：剩余标记扣除剩余弃点名额后，能否与未占用格位匹配。"""
-            remaining = order[start:]
-            required = len(remaining) - discard_left
-            if required <= 0:
-                return True
-            match: dict[Cell, int] = {}
-
-            def augment(mi, seen):
-                for r, c, _res in cand[mi]:
-                    cell = (r, c)
-                    if cell in used or cell in seen:
-                        continue
-                    seen.add(cell)
-                    if cell not in match or augment(match[cell], seen):
-                        match[cell] = mi
-                        return True
-                return False
-
-            size = 0
-            for mi in remaining:
-                if augment(mi, set()):
-                    size += 1
-                    if size >= required:
-                        return True
-            return False
-
-        def dfs(idx, d, cur_max, cur_sum):
-            nonlocal global_best
-            best = global_best
-            # 下界剪枝：弃点数只增不减；同层时最大残差、残差和也只增不减
-            if best is not None:
-                bk, bmax, bsum = best.key[0], best.key[1], best.key[2]
-                if d > bk:
-                    return
-                if d == bk and (cur_max > bmax or cur_sum > bsum):
-                    return
-
-            # 剩余名额不足以把剩余标记互异放入格位则剪枝
-            if not can_complete(idx, budget - d):
-                return
-
-            if idx == len(order):
-                seq = []
-                for i in range(n):
-                    seq.append(assign[i] if i in assign else DISCARD_CELL)
-                params_key = (ox, oy, b1x, b1y, b2x, b2y)
-                key = (d, cur_max, cur_sum, params_key, tuple(seq))
-                stats["complete_assignments_explored"] += 1
-                if global_best is None or key < global_best.key:
-                    global_best = _Solution(key, dict(assign), dict(discarded))
-                return
-
-            i = order[idx]
+        ncells = rows * cols
+        free_markers = [i for i in range(n) if cand[i]]
+        # 每个可选标记的邻接表（格位下标）与残差
+        adj: list[list[int]] = [[] for _ in range(n)]
+        res_of: list[dict[int, int]] = [{} for _ in range(n)]
+        for i in free_markers:
             for r, c, res in cand[i]:
-                if (r, c) in used:
-                    continue
-                new_max = cur_max if cur_max >= res else res
-                if (
-                    global_best is not None
-                    and d == global_best.key[0]
-                    and (
-                        new_max > global_best.key[1]
-                        or (
-                            new_max == global_best.key[1]
-                            and cur_sum + res > global_best.key[2]
-                        )
-                    )
-                ):
-                    # 候选按残差升序；此处不可行则后续格位只会更差
-                    break
+                cj = r * cols + c
+                adj[i].append(cj)
+                res_of[i][cj] = res
+
+        # 1) 最少弃点数：可互异放入真实格位的最大标记数
+        matched = _kuhn_size(adj)
+        d = n - matched
+        if d > budget:
+            return
+        gb0 = global_best
+        if gb0 is not None and d > gb0.key[0]:
+            return
+
+        # 2) 最小最大残差：在出现过的残差阈值上二分，找仍能互异放入
+        #    matched 个标记的最小阈值。
+        thresholds = sorted({res_of[i][cj] for i in free_markers for cj in adj[i]})
+        best_max = 0
+
+        def threshold_feasible(th):
+            sub = [
+                [cj for cj in adj[i] if res_of[i][cj] <= th] if cand[i] else []
+                for i in range(n)
+            ]
+            return _kuhn_size(sub, stop_at=matched) >= matched
+
+        if thresholds:
+            if not threshold_feasible(thresholds[-1]):  # 理论上不会发生
+                return
+            lo, hi = 0, len(thresholds) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if threshold_feasible(thresholds[mid]):
+                    hi = mid
+                else:
+                    lo = mid + 1
+            best_max = thresholds[lo]
+
+        gb1 = global_best
+        if gb1 is not None and d == gb1.key[0] and best_max > gb1.key[1]:
+            return
+
+        # 3a) 小整数费用匈牙利：只优化残差总和（弃点列为大常数 D0），
+        #     得到本组参数下的最小残差总和，供与现任最优比较、剪枝。
+        params_key = (ox, oy, b1x, b1y, b2x, b2y)
+        D0 = n * (2 * tolerance + 1) + 1
+        bad0 = D0 * (n + 1)
+        ncol = ncells + d
+        small = [[0] * ncol for _ in range(n)]
+        for i in range(n):
+            row = small[i]
+            for cj in range(ncells):
+                res = res_of[i].get(cj)
+                if i in forced or res is None or res > best_max:
+                    row[cj] = bad0
+                else:
+                    row[cj] = res
+            for q in range(d):
+                row[ncells + q] = D0
+        col0, _ = _hungarian(small)
+        total_res = 0
+        for i, col in enumerate(col0):
+            if col < ncells:
+                total_res += res_of[i][col]
+
+        # 残差总和不优于现任、且参数序列也不更小时，无资格成为全局最优
+        gb2 = global_best
+        if (
+            gb2 is not None
+            and d == gb2.key[0]
+            and best_max == gb2.key[1]
+            and (
+                total_res > gb2.key[2]
+                or (total_res == gb2.key[2] and params_key > gb2.key[3])
+            )
+        ):
+            return
+
+        # 3b) 分级整数费用匈牙利：在不改变弃点数/最大残差/残差总和的前提下
+        #    取字典序最小的完整分配序列（大整数精确，无浮点）：
+        #      真实列: res*B + q*W^(n-1-i)
+        #      虚拟列: D     （弃点格位 (-1,-1) 编码数字 q=0）
+        #    q=cj+1 按行主序与格位一一对应且严格递增；数字序列 (q_0..q_{n-1})
+        #    的 W 进制位值之和，其数值大小顺序与“按标记编号排列的完整分配序列”
+        #    字典序完全一致。B=W^n+1 大于任何位值之和，使残差总和优先；
+        #    D 大于任何全真实费用，使弃点数最少优先。
+        W = ncells + 1
+        B = W ** n + 1
+        D1 = (n * (2 * tolerance + 1) + 1) * B + 1
+        bad1 = D1 * (n + 1)
+        weights = [W ** (n - 1 - i) for i in range(n)]
+        cost = [[0] * ncol for _ in range(n)]
+        for i in range(n):
+            row = cost[i]
+            weight = weights[i]
+            for cj in range(ncells):
+                res = res_of[i].get(cj)
+                if i in forced or res is None or res > best_max:
+                    row[cj] = bad1
+                else:
+                    row[cj] = res * B + (cj + 1) * weight
+            for q in range(d):
+                row[ncells + q] = D1  # 弃点：位值数字 0
+
+        col_for_row, _ = _hungarian(cost)
+
+        assign: dict[int, Cell] = {}
+        discarded: dict[int, str] = {}
+        total_res = 0
+        for i, col in enumerate(col_for_row):
+            if col < ncells:
+                r, c = divmod(col, cols)
                 assign[i] = (r, c)
-                used.add((r, c))
-                dfs(idx + 1, d, new_max, cur_sum + res)
-                used.discard((r, c))
-                del assign[i]
-
-            # 作为杂点弃去
-            if d + 1 <= budget:
-                discarded[i] = "outlier_excluded"
-                dfs(idx + 1, d + 1, cur_max, cur_sum)
-                discarded.pop(i, None)
-
-        dfs(0, len(forced), 0, 0)
+                total_res += res_of[i][col]
+            else:
+                discarded[i] = (
+                    "no_cell_within_tolerance" if i in forced else "outlier_excluded"
+                )
+        assert len(discarded) == d
+        seq = [assign.get(i, DISCARD_CELL) for i in range(n)]
+        key = (d, best_max, total_res, params_key, tuple(seq))
+        stats["complete_assignments_explored"] += 1
+        if global_best is None or key < global_best.key:
+            global_best = _Solution(key, assign, discarded)
 
     for b1x, b1y, b2x, b2y in basis_pairs:
         # centers[i] = [(r, c, cx, cy)]，cx/cy 使该标记落在 (r,c) 时

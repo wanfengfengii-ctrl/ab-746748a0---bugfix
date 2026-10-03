@@ -253,6 +253,78 @@ def test_bruteforce_optimality_small():
     assert res["discarded_count"] == best_key[0]
 
 
+def test_dense_colocated_markers_exact_verdict():
+    # 稠密同坐标回归：14 个标记全部在 (0,0)，原点/基向量固定，容差 6，不弃点。
+    # 历史上该实例在互异分配搜索中长期无结果；这里要求稳定的短时间内精确返回
+    # 唯一字典序最优裁决。
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    fixed = dict(
+        origin_x=(0, 0), origin_y=(0, 0),
+        basis_row_x=(1, 1), basis_row_y=(0, 0),
+        basis_col_x=(0, 0), basis_col_y=(1, 1),
+    )
+    t0 = time.monotonic()
+    res = solve(markers, 7, 7, 6, max_outliers=0, **fixed)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5, f"稠密实例耗时 {elapsed:.2f}s，未在稳定短时间内返回"
+    assert res["feasible"] is True
+    assert res["discarded_count"] == 0
+    assert res["used_marker_count"] == 14
+    assert res["max_manhattan_residual"] == 4
+    assert res["total_residual"] == 36
+    cells = [tuple(a["grid_cell"]) for a in res["assignments"]]
+    expected = (
+        [(0, c) for c in range(5)]
+        + [(1, c) for c in range(4)]
+        + [(2, c) for c in range(3)]
+        + [(3, c) for c in range(2)]
+    )
+    assert cells == expected
+    assert len(set(cells)) == 14, "14 个格位必须全部互异"
+    assert res["parameters"] == {
+        "origin": [0, 0], "basis_row": [1, 0],
+        "basis_col": [0, 1], "determinant": 1,
+    }
+
+
+def test_dense_colocated_conflict_infeasible_without_budget():
+    # 格位冲突导致的无解：14 个同坐标标记、9 个格位、无弃点预算
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    fixed = dict(
+        origin_x=(0, 0), origin_y=(0, 0),
+        basis_row_x=(1, 1), basis_row_y=(0, 0),
+        basis_col_x=(0, 0), basis_col_y=(1, 1),
+    )
+    res = solve(markers, 3, 3, 6, max_outliers=0, **fixed)
+    assert res["feasible"] is False
+    codes = [r["code"] for r in res["reasons"]]
+    assert "no_distinct_cell_assignment" in codes
+    # 即便弃点预算 2，仍差 3 个格位，同样无解
+    res2 = solve(markers, 3, 3, 6, max_outliers=2, **fixed)
+    assert res2["feasible"] is False
+
+
+def test_dense_colocated_uses_outlier_budget():
+    # 14 个同坐标标记、12 个格位、预算 2：恰好弃 2 个后可行
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    fixed = dict(
+        origin_x=(0, 0), origin_y=(0, 0),
+        basis_row_x=(1, 1), basis_row_y=(0, 0),
+        basis_col_x=(0, 0), basis_col_y=(1, 1),
+    )
+    t0 = time.monotonic()
+    res = solve(markers, 4, 3, 6, max_outliers=2, **fixed)
+    assert time.monotonic() - t0 < 5
+    assert res["feasible"] is True
+    assert res["discarded_count"] == 2
+    assert res["used_marker_count"] == 12
+    cells = [tuple(a["grid_cell"]) for a in res["assignments"]]
+    assert len(set(cells)) == 12
+    # 弃点格位 (-1,-1) 字典序最小，故被弃的是编号最小的两个标记
+    assert [d["marker_id"] for d in res["discarded"]] == [1, 2]
+    assert cells == [(r, c) for r in range(4) for c in range(3)]
+
+
 def test_worst_case_runtime():
     # 7x7 栅格、14 个点、所有区间跨度 6：性能回归保护
     rng = random.Random(2024)
