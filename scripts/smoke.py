@@ -194,6 +194,41 @@ def scenario_duplicate_ids():
     check("错误信息提及唯一编号", "唯一" in json.dumps(body, ensure_ascii=False))
 
 
+def scenario_dense_identical_positions():
+    print("场景 6：14 个全同坐标标记（7x7、容差 6、参数固定、不弃点）稠密回归")
+    payload = {
+        "markers": [{"id": i, "x": 0, "y": 0} for i in range(1, 15)],
+        "rows": 7, "cols": 7, "tolerance": 6, "max_outliers": 0,
+        "origin_x": {"lo": 0, "hi": 0}, "origin_y": {"lo": 0, "hi": 0},
+        "basis_row_x": {"lo": 1, "hi": 1},
+        "basis_row_y": {"lo": 0, "hi": 0},
+        "basis_col_x": {"lo": 0, "hi": 0},
+        "basis_col_y": {"lo": 1, "hi": 1},
+    }
+    import time
+    t0 = time.monotonic()
+    status, body = post("/api/wafer-grids/reconstruct", payload)
+    elapsed = time.monotonic() - t0
+    check("HTTP 200", status == 200, f"status={status} body={body}")
+    check("feasible=true", body.get("feasible") is True)
+    check("及时返回（< 8s）", elapsed < 8, f"耗时 {elapsed:.2f}s")
+    if not body.get("feasible"):
+        return
+    check("不弃点", body["discarded_count"] == 0)
+    check("保留 14 个标记", body["used_marker_count"] == 14)
+    check("最大曼哈顿残差为 4", body["max_manhattan_residual"] == 4)
+    check("残差总和为 36", body["total_residual"] == 36)
+    expected = (
+        [(0, c) for c in range(5)]
+        + [(1, c) for c in range(4)]
+        + [(2, c) for c in range(3)]
+        + [(3, c) for c in range(2)]
+    )
+    got = [tuple(a["grid_cell"]) for a in body["assignments"]]
+    check("格位序列为字典序最优", got == expected, str(got))
+    check("14 个格位互异", len(set(got)) == 14)
+
+
 def main():
     print(f"冒烟目标: {BASE_URL}")
     scenario_missing_and_outliers()
@@ -201,6 +236,7 @@ def main():
     scenario_no_solution()
     scenario_bad_interval()
     scenario_duplicate_ids()
+    scenario_dense_identical_positions()
     print(f"\n冒烟结果: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0
 

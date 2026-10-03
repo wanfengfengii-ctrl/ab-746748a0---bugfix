@@ -17,7 +17,7 @@ API_PORT="${API_PORT:-8080}"
 run_tests_and_smoke() {
   echo "==> [1/2] 代码测试 (pytest)"
   python -m pytest -q tests
-  echo "==> [2/2] 复原冒烟（漏读 + 杂点 + 无解 + 输入矛盾）"
+  echo "==> [2/2] 复原冒烟（漏读 + 杂点 + 无解 + 输入矛盾 + 稠密同坐标）"
   BASE_URL="$1" python scripts/smoke.py
 }
 

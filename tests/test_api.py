@@ -137,3 +137,52 @@ def test_reject_too_many_outliers():
     p = base_payload(max_outliers=3)
     r = client.post("/api/wafer-grids/reconstruct", json=p)
     assert r.status_code == 422
+
+
+def test_dense_identical_positions_exact_verdict():
+    # 回归：14 个全同坐标标记，参数全固定，须快速返回字典序最优裁决
+    payload = {
+        "markers": [{"id": i, "x": 0, "y": 0} for i in range(1, 15)],
+        "rows": 7, "cols": 7, "tolerance": 6, "max_outliers": 0,
+        "origin_x": {"lo": 0, "hi": 0}, "origin_y": {"lo": 0, "hi": 0},
+        "basis_row_x": {"lo": 1, "hi": 1},
+        "basis_row_y": {"lo": 0, "hi": 0},
+        "basis_col_x": {"lo": 0, "hi": 0},
+        "basis_col_y": {"lo": 1, "hi": 1},
+    }
+    r = client.post("/api/wafer-grids/reconstruct", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["feasible"] is True
+    assert body["discarded_count"] == 0
+    assert body["used_marker_count"] == 14
+    assert body["max_manhattan_residual"] == 4
+    assert body["total_residual"] == 36
+    expected = (
+        [[0, c] for c in range(5)]
+        + [[1, c] for c in range(4)]
+        + [[2, c] for c in range(3)]
+        + [[3, c] for c in range(2)]
+    )
+    got = [a["grid_cell"] for a in body["assignments"]]
+    assert got == expected
+    assert len({tuple(cell) for cell in got}) == 14
+
+
+def test_dense_cell_conflict_no_solution():
+    # 格位冲突：14 个全同标记、容差 0 只有一个格位，无法互异分配 -> feasible=false
+    payload = {
+        "markers": [{"id": i, "x": 0, "y": 0} for i in range(1, 15)],
+        "rows": 3, "cols": 3, "tolerance": 0, "max_outliers": 0,
+        "origin_x": {"lo": 0, "hi": 0}, "origin_y": {"lo": 0, "hi": 0},
+        "basis_row_x": {"lo": 1, "hi": 1},
+        "basis_row_y": {"lo": 0, "hi": 0},
+        "basis_col_x": {"lo": 0, "hi": 0},
+        "basis_col_y": {"lo": 1, "hi": 1},
+    }
+    r = client.post("/api/wafer-grids/reconstruct", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["feasible"] is False
+    assert body["reasons"]
+    assert all("无解" in x["message"] for x in body["reasons"])

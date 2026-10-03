@@ -271,3 +271,101 @@ def test_worst_case_runtime():
     assert res["discarded_count"] <= 2
     assert_distinct_cells(res)
     assert elapsed < 30, f"最坏情形耗时 {elapsed:.1f}s，超过 30s 预算"
+
+
+def _fixed_unit_basis_intervals():
+    return dict(
+        origin_x=(0, 0), origin_y=(0, 0),
+        basis_row_x=(1, 1), basis_row_y=(0, 0),
+        basis_col_x=(0, 0), basis_col_y=(1, 1),
+    )
+
+
+def test_dense_identical_positions_exact_verdict():
+    # 回归：14 个标记全部位于 (0,0)，7x7 栅格、容差 6、参数全固定、不弃点。
+    # 旧实现在此稠密同坐标实例上枚举指数级对称分配而长期无结果。
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    t0 = time.monotonic()
+    res = solve(markers, 7, 7, 6, max_outliers=0, **_fixed_unit_basis_intervals())
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5, f"稠密实例耗时 {elapsed:.2f}s"
+    assert res["feasible"]
+    assert res["discarded_count"] == 0
+    assert res["used_marker_count"] == 14
+    assert res["max_manhattan_residual"] == 4
+    assert res["total_residual"] == 36
+    expected_cells = (
+        [(0, c) for c in range(5)]
+        + [(1, c) for c in range(4)]
+        + [(2, c) for c in range(3)]
+        + [(3, c) for c in range(2)]
+    )
+    got_cells = [tuple(a["grid_cell"]) for a in res["assignments"]]
+    assert got_cells == expected_cells
+    assert len(set(got_cells)) == 14
+    # 目标序列前三项与裁决一致
+    assert res["objective"] == [0, 4, 36]
+
+
+def _assert_distinct_cells_within(res, tol):
+    cells = [tuple(a["grid_cell"]) for a in res["assignments"]]
+    assert len(cells) == len(set(cells)), "两个标记占用了同一格位"
+    for a in res["assignments"]:
+        r, c = a["grid_cell"]
+        assert 0 <= r < res["grid"]["rows"]
+        assert 0 <= c < res["grid"]["cols"]
+        assert abs(a["residual"]["x"]) <= tol
+        assert abs(a["residual"]["y"]) <= tol
+        assert a["residual"]["manhattan"] == abs(a["residual"]["x"]) + abs(
+            a["residual"]["y"]
+        )
+        p = res["parameters"]
+        px = p["origin"][0] + r * p["basis_row"][0] + c * p["basis_col"][0]
+        py = p["origin"][1] + r * p["basis_row"][1] + c * p["basis_col"][1]
+        assert a["predicted"] == [px, py]
+
+
+def test_dense_identical_positions_timing_budget_invariant():
+    # 同一稠密实例在不同弃点预算下均快速且语义稳定（0 弃点始终最优）
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    wide = dict(
+        origin_x=(-3, 3), origin_y=(-3, 3),
+        basis_row_x=(0, 6), basis_row_y=(-3, 3),
+        basis_col_x=(-3, 3), basis_col_y=(0, 6),
+    )
+    for budget in (0, 1, 2):
+        t0 = time.monotonic()
+        res = solve(markers, 7, 7, 6, max_outliers=budget, **wide)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 30, f"预算 {budget} 耗时 {elapsed:.1f}s"
+        assert res["feasible"]
+        assert res["discarded_count"] == 0
+        _assert_distinct_cells_within(res, 6)
+
+
+def test_dense_cell_conflict_infeasible():
+    # 格位冲突无解：14 个全同标记、容差 0 时只有 (0,0) 一个格位，
+    # 弃点预算 0 或 2 都无法满足互异分配
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 15)]
+    for budget in (0, 2):
+        res = solve(markers, 3, 3, 0, max_outliers=budget,
+                    **_fixed_unit_basis_intervals())
+        assert not res["feasible"]
+        assert res["reasons"]
+        assert all("无解" in r["message"] for r in res["reasons"])
+        codes = {r["code"] for r in res["reasons"]}
+        assert "no_distinct_cell_assignment" in codes
+
+
+def test_dense_outlier_budget_allows_partial_conflict():
+    # 同一物理位置标记数超过可行格位数时，弃点预算内可解、超预算无解；
+    # 13 个全同点、5x3 栅格（容差 3 时 12 个格位可达），弃 1 点可行
+    markers = [{"id": i, "x": 0, "y": 0} for i in range(1, 14)]
+    iv = _fixed_unit_basis_intervals()
+    res1 = solve(markers, 5, 3, 3, max_outliers=1, **iv)
+    assert res1["feasible"]
+    assert res1["discarded_count"] == 1
+    _assert_distinct_cells_within(res1, 3)
+    res0 = solve(markers, 5, 3, 3, max_outliers=0, **iv)
+    assert not res0["feasible"]
+
